@@ -64,6 +64,14 @@ static inline bool ts_language_has_reduce_action(
   return entry.action_count > 0 && entry.actions[0].type == TSParseActionTypeReduce;
 }
 
+static inline bool ts_language_is_small_state(const TSLanguage *self, TSStateId state) {
+  if (self->abi_version >= LANGUAGE_VERSION_WITH_COMPRESSED_TABLES) {
+    return self->small_parse_table_map && self->small_parse_table_map[state] != UINT32_MAX;
+  }
+
+  return state >= self->large_state_count;
+}
+
 // Lookup the table value for a given symbol and state.
 //
 // For non-terminal symbols, the table value represents a successor state.
@@ -78,6 +86,20 @@ static inline uint16_t ts_language_lookup(
   TSSymbol symbol
 ) {
   if (self->abi_version >= LANGUAGE_VERSION_WITH_COMPRESSED_TABLES) {
+    if (ts_language_is_small_state(self, state)) {
+      uint32_t index = self->small_parse_table_map[state];
+      const uint16_t *data = &self->small_parse_table[index];
+      uint16_t group_count = *(data++);
+      for (unsigned i = 0; i < group_count; i++) {
+        uint16_t section_value = *(data++);
+        uint16_t symbol_count = *(data++);
+        for (unsigned j = 0; j < symbol_count; j++) {
+          if (*(data++) == symbol) return section_value;
+        }
+      }
+      return 0;
+    }
+
     uint32_t start = self->parse_table_row_offsets[state];
     uint32_t end = self->parse_table_row_offsets[state + 1];
     // Binary search for symbol in compressed_parse_table[start*2..end*2]
@@ -131,14 +153,15 @@ static inline LookaheadIterator ts_language_lookaheads(
   const TSLanguage *self,
   TSStateId state
 ) {
-  bool is_small_state = (self->abi_version < LANGUAGE_VERSION_WITH_COMPRESSED_TABLES)
-    && state >= self->large_state_count;
+  bool is_small_state = ts_language_is_small_state(self, state);
   const uint16_t *data;
   const uint16_t *group_end = NULL;
   uint16_t group_count = 0;
   uint16_t section_index = 0;
   if (is_small_state) {
-    uint32_t index = self->small_parse_table_map[state - self->large_state_count];
+    uint32_t index = self->abi_version >= LANGUAGE_VERSION_WITH_COMPRESSED_TABLES
+      ? self->small_parse_table_map[state]
+      : self->small_parse_table_map[state - self->large_state_count];
     data = &self->small_parse_table[index];
     group_end = data + 1;
     group_count = *data;

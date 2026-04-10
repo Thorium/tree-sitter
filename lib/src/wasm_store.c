@@ -1388,10 +1388,11 @@ const TSLanguage *ts_wasm_store_load_language(
     );
   }
 
-  if (language->state_count > language->large_state_count &&
-      language->abi_version < LANGUAGE_VERSION_WITH_COMPRESSED_TABLES) {
-    // ABI 16+ uses CSR arrays instead of small_parse_table
-    uint32_t small_state_count = wasm_language.state_count - wasm_language.large_state_count;
+  if (language->state_count > language->large_state_count ||
+      language->abi_version >= LANGUAGE_VERSION_WITH_COMPRESSED_TABLES) {
+    uint32_t small_state_count = language->abi_version >= LANGUAGE_VERSION_WITH_COMPRESSED_TABLES
+      ? wasm_language.state_count
+      : wasm_language.state_count - wasm_language.large_state_count;
     language->small_parse_table_map = copy(
       &memory[wasm_language.small_parse_table_map],
       small_state_count * sizeof(uint32_t)

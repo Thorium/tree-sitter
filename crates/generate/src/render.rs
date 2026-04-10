@@ -2,7 +2,7 @@ use std::{
     cmp,
     collections::{BTreeMap, BTreeSet},
     fmt::Write,
-    mem::swap,
+    mem::{size_of, swap},
 };
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -119,7 +119,167 @@ struct Metadata {
     patch: u8,
 }
 
+#[derive(Clone)]
+struct CompressedParseTableEntry {
+    column: u16,
+    value: u16,
+    is_goto: bool,
+}
+
+#[derive(Clone)]
+struct SmallParseTableGroup {
+    value: u16,
+    is_goto: bool,
+    symbols: Vec<Symbol>,
+}
+
+#[derive(Clone)]
+struct SmallStateCandidate {
+    canonical_key: Vec<u16>,
+    groups: Vec<SmallParseTableGroup>,
+    entry_count: usize,
+}
+
+impl SmallStateCandidate {
+    const fn encoded_words(&self) -> usize {
+        1 + 2 * self.groups.len() + self.entry_count
+    }
+
+    const fn encoded_bytes(&self) -> usize {
+        self.encoded_words() * size_of::<u16>()
+    }
+}
+
+#[derive(Clone)]
+struct ParseStateEncoding {
+    csr_entries: Vec<CompressedParseTableEntry>,
+    small_candidate: SmallStateCandidate,
+}
+
 impl Generator {
+    fn parse_state_encoding(
+        &self,
+        state_idx: usize,
+        state: &crate::tables::ParseState,
+        parse_table_entries: &mut FxHashMap<ParseTableEntry, usize>,
+        next_parse_action_list_index: &mut usize,
+    ) -> ParseStateEncoding {
+        let mut csr_entries =
+            Vec::with_capacity(state.terminal_entries.len() + state.nonterminal_entries.len());
+
+        for (symbol, action) in &state.nonterminal_entries {
+            let col = match self.symbol_order.get(symbol) {
+                Some(&c) => c,
+                None => match self.symbol_order.get(&Symbol::end()) {
+                    Some(&c) if *symbol == Symbol::end_of_nonterminal_extra() => c,
+                    _ => continue,
+                },
+            };
+            let state_id = match action {
+                GotoAction::Goto(s) => *s,
+                GotoAction::ShiftExtra => state_idx,
+            };
+            csr_entries.push(CompressedParseTableEntry {
+                column: col as u16,
+                value: state_id as u16,
+                is_goto: true,
+            });
+        }
+
+        for (symbol, entry) in &state.terminal_entries {
+            let col = match self.symbol_order.get(symbol) {
+                Some(&c) => c,
+                None => match self.symbol_order.get(&Symbol::end()) {
+                    Some(&c) if *symbol == Symbol::end_of_nonterminal_extra() => c,
+                    _ => continue,
+                },
+            };
+            let entry_id = Self::get_parse_action_list_id(
+                entry,
+                parse_table_entries,
+                next_parse_action_list_index,
+            );
+            csr_entries.push(CompressedParseTableEntry {
+                column: col as u16,
+                value: entry_id as u16,
+                is_goto: false,
+            });
+        }
+
+        csr_entries.sort_unstable_by_key(|entry| entry.column);
+
+        let mut symbols_by_value = FxHashMap::<(u16, bool), Vec<Symbol>>::default();
+        for (symbol, entry) in &state.terminal_entries {
+            let entry_id = Self::get_parse_action_list_id(
+                entry,
+                parse_table_entries,
+                next_parse_action_list_index,
+            );
+            symbols_by_value
+                .entry((entry_id as u16, false))
+                .or_default()
+                .push(*symbol);
+        }
+        for (symbol, action) in &state.nonterminal_entries {
+            let state_id = match action {
+                GotoAction::Goto(i) => *i,
+                GotoAction::ShiftExtra => state_idx,
+            };
+            symbols_by_value
+                .entry((state_id as u16, true))
+                .or_default()
+                .push(*symbol);
+        }
+
+        let mut groups = symbols_by_value
+            .drain()
+            .map(|((value, is_goto), mut symbols)| {
+                symbols.sort_unstable();
+                SmallParseTableGroup {
+                    value,
+                    is_goto,
+                    symbols,
+                }
+            })
+            .collect::<Vec<_>>();
+        groups.sort_unstable_by(|a, b| {
+            (a.symbols.len(), a.is_goto, a.value, a.symbols[0]).cmp(&(
+                b.symbols.len(),
+                b.is_goto,
+                b.value,
+                b.symbols[0],
+            ))
+        });
+
+        let mut canonical_key = Vec::new();
+        canonical_key.push(groups.len() as u16);
+        for group in &groups {
+            canonical_key.push(u16::from(group.is_goto));
+            canonical_key.push(group.value);
+            canonical_key.push(group.symbols.len() as u16);
+            for symbol in &group.symbols {
+                let remapped_symbol = if *symbol == Symbol::end_of_nonterminal_extra() {
+                    Symbol::end()
+                } else {
+                    *symbol
+                };
+                canonical_key.push(self.symbol_ids[&remapped_symbol].len() as u16);
+                canonical_key.extend(self.symbol_ids[&remapped_symbol].bytes().map(u16::from));
+            }
+        }
+
+        let entry_count = groups.iter().map(|group| group.symbols.len()).sum();
+
+        ParseStateEncoding {
+            csr_entries,
+            small_candidate: SmallStateCandidate {
+                canonical_key,
+                groups,
+                entry_count,
+            },
+        }
+    }
+
     fn generate(mut self) -> RenderResult<String> {
         self.init();
         self.add_header();
@@ -340,48 +500,10 @@ impl Generator {
             })
             .count();
 
-        // Decide whether to use CSR-compressed parse tables (ABI 16) or fall
-        // back to legacy format (ABI 15).  This must happen before any
-        // rendering so that `self.abi_version` is consistent when `add_stats`
-        // emits `#define LANGUAGE_VERSION`.
+        // ABI 16 always uses compressed parse tables. Choose the smallest
+        // representation for each state between CSR and small-state encoding.
         if self.abi_version >= ABI_VERSION_WITH_COMPRESSED_TABLES {
-            let state_count = self.parse_table.states.len();
-            let symbol_count = self.parse_table.symbols.len();
-            let total_nnz: usize = self
-                .parse_table
-                .states
-                .iter()
-                .map(|s| s.terminal_entries.len() + s.nonterminal_entries.len())
-                .sum();
-
-            // CSR: row_offsets (uint32) + interleaved (symbol, value) pairs (2x uint16 each)
-            let csr_cost = (state_count + 1) * 4 + total_nnz * 4;
-
-            // Legacy: dense table for large states + small_parse_table + map
-            let dense_cost = self.large_state_count * symbol_count * 2;
-            let small_state_cost: usize = self
-                .parse_table
-                .states
-                .iter()
-                .skip(self.large_state_count)
-                .map(|s| {
-                    let entries = s.terminal_entries.len() + s.nonterminal_entries.len();
-                    let terminal_groups: FxHashSet<_> = s.terminal_entries.values().collect();
-                    let nonterminal_groups: FxHashSet<_> = s.nonterminal_entries.values().collect();
-                    let groups = terminal_groups.len() + nonterminal_groups.len();
-                    (1 + groups * 3 + entries * 2) * 2
-                })
-                .sum();
-            let small_map_cost = (state_count - self.large_state_count) * 4;
-            let legacy_cost = dense_cost + small_state_cost + small_map_cost;
-
-            if csr_cost < legacy_cost {
-                self.use_compressed_tables = true;
-            } else {
-                // CSR would be larger — fall back to legacy format.
-                self.use_compressed_tables = false;
-                self.abi_version = ABI_VERSION_WITH_COMPRESSED_TABLES - 1;
-            }
+            self.use_compressed_tables = true;
         }
     }
 
@@ -1376,13 +1498,13 @@ impl Generator {
 
     /// Emit the CSR (Compressed Sparse Row) parse table for ABI >= 16.
     ///
-    /// This replaces both `ts_parse_table[LARGE_STATE_COUNT][SYMBOL_COUNT]`
-    /// and `ts_small_parse_table[]` with two flat arrays:
-    ///   - `ts_parse_table_row_offsets[STATE_COUNT + 1]`  (`uint32_t`, cumulative NNZ)
-    ///   - `ts_compressed_parse_table[TOTAL_NNZ * 2]`     (`uint16_t`, interleaved
-    ///     (symbol, value) pairs using symbol enum names and `STATE()`/`ACTIONS()` macros)
+    /// This partitions parse states between CSR and small-state encodings.
+    /// CSR states use `ts_parse_table_row_offsets` and `ts_compressed_parse_table`.
+    /// Small states use `ts_small_parse_table` with a full-state
+    /// `ts_small_parse_table_map`, using `UINT32_MAX` to mark CSR states.
     ///
-    /// Lookup is O(log n) binary search on the symbol entries for a given state's row.
+    /// Lookup is O(log n) for CSR states and linear in grouped symbols for
+    /// small states.
     fn add_compressed_parse_table(
         &mut self,
         parse_table_entries: &mut FxHashMap<ParseTableEntry, usize>,
@@ -1398,54 +1520,45 @@ impl Generator {
             .map(|(symbol, &col)| (col, *symbol))
             .collect();
 
-        // Build CSR entries directly from the sparse entry maps, avoiding a
-        // full state_count x symbol_count dense matrix allocation.
-        // Each entry is (col_index, value, is_goto).
         let mut row_offsets = Vec::with_capacity(state_count + 1);
-        let mut entries_buf: Vec<(u16, u16, bool)> = Vec::new();
-        let mut all_state_entries: Vec<Vec<(u16, u16, bool)>> = Vec::with_capacity(state_count);
+        let mut all_state_entries: Vec<Vec<CompressedParseTableEntry>> =
+            Vec::with_capacity(state_count);
+        let mut small_state_map = Vec::with_capacity(state_count);
+        let mut seen_small_data: FxHashMap<Vec<u16>, usize> = FxHashMap::default();
+        let mut small_state_data: Vec<Option<Vec<SmallParseTableGroup>>> = Vec::new();
+        let mut next_small_table_index = 0usize;
         let mut total_nnz: usize = 0;
-
         for (state_idx, state) in self.parse_table.states.iter().enumerate() {
-            entries_buf.clear();
+            let encoding = self.parse_state_encoding(
+                state_idx,
+                state,
+                parse_table_entries,
+                next_parse_action_list_index,
+            );
+            let csr_cost = encoding.csr_entries.len() * 2 * size_of::<u16>();
+            let small_cost = encoding.small_candidate.encoded_bytes();
 
-            for (symbol, action) in &state.nonterminal_entries {
-                let col = match self.symbol_order.get(symbol) {
-                    Some(&c) => c,
-                    None => match self.symbol_order.get(&Symbol::end()) {
-                        Some(&c) if *symbol == Symbol::end_of_nonterminal_extra() => c,
-                        _ => continue,
-                    },
-                };
-                let state_id = match action {
-                    GotoAction::Goto(s) => *s,
-                    GotoAction::ShiftExtra => state_idx,
-                };
-                entries_buf.push((col as u16, state_id as u16, true));
-            }
-
-            for (symbol, entry) in &state.terminal_entries {
-                let col = match self.symbol_order.get(symbol) {
-                    Some(&c) => c,
-                    None => match self.symbol_order.get(&Symbol::end()) {
-                        Some(&c) if *symbol == Symbol::end_of_nonterminal_extra() => c,
-                        _ => continue,
-                    },
-                };
-                let entry_id = Self::get_parse_action_list_id(
-                    entry,
-                    parse_table_entries,
-                    next_parse_action_list_index,
-                );
-                entries_buf.push((col as u16, entry_id as u16, false));
-            }
-
-            // CSR requires columns to be sorted within each row.
-            entries_buf.sort_unstable_by_key(|&(col, _, _)| col);
+            let use_small = state_idx > 1 && small_cost < csr_cost;
 
             row_offsets.push(total_nnz as u32);
-            total_nnz += entries_buf.len();
-            all_state_entries.push(entries_buf.clone());
+            if use_small {
+                if let Some(&existing_index) =
+                    seen_small_data.get(&encoding.small_candidate.canonical_key)
+                {
+                    small_state_map.push(existing_index as u32);
+                } else {
+                    let table_index = next_small_table_index;
+                    next_small_table_index += encoding.small_candidate.encoded_words();
+                    seen_small_data.insert(encoding.small_candidate.canonical_key, table_index);
+                    small_state_map.push(table_index as u32);
+                    small_state_data.push(Some(encoding.small_candidate.groups));
+                }
+                all_state_entries.push(Vec::new());
+            } else {
+                total_nnz += encoding.csr_entries.len();
+                small_state_map.push(u32::MAX);
+                all_state_entries.push(encoding.csr_entries);
+            }
         }
         row_offsets.push(total_nnz as u32);
 
@@ -1483,15 +1596,15 @@ impl Generator {
         for (state_idx, entries) in all_state_entries.iter().enumerate() {
             if !entries.is_empty() {
                 add_line!(self, "// State {state_idx}");
-                for &(col, val, is_goto) in entries {
+                for entry in entries {
                     let symbol = col_to_symbol
-                        .get(&(col as usize))
+                        .get(&(entry.column as usize))
                         .expect("column index must map to a symbol");
                     let symbol_name = &self.symbol_ids[symbol];
-                    if is_goto {
-                        add_line!(self, "{symbol_name}, STATE({val}),");
+                    if entry.is_goto {
+                        add_line!(self, "{symbol_name}, STATE({}),", entry.value);
                     } else {
-                        add_line!(self, "{symbol_name}, ACTIONS({val}),");
+                        add_line!(self, "{symbol_name}, ACTIONS({}),", entry.value);
                     }
                 }
                 add_line!(self, "");
@@ -1502,19 +1615,54 @@ impl Generator {
         add_line!(self, "}};");
         add_line!(self, "");
 
-        // Emit empty small_parse_table and map so the struct fields compile.
-        if self.large_state_count < self.parse_table.states.len() {
-            add_line!(
-                self,
-                "static const uint16_t ts_small_parse_table[] = {{0}};"
-            );
-            add_line!(self, "");
-            add_line!(
-                self,
-                "static const uint32_t ts_small_parse_table_map[] = {{0}};",
-            );
-            add_line!(self, "");
+        add_line!(self, "static const uint16_t ts_small_parse_table[] = {{");
+        indent!(self);
+        let mut current_index = 0usize;
+        for groups in small_state_data.into_iter().flatten() {
+            add_line!(self, "[{current_index}] = {},", groups.len());
+            indent!(self);
+            current_index += 1;
+            for group in groups {
+                current_index += 2 + group.symbols.len();
+                if group.is_goto {
+                    add_line!(self, "STATE({}), {},", group.value, group.symbols.len());
+                } else {
+                    add_line!(self, "ACTIONS({}), {},", group.value, group.symbols.len());
+                }
+                indent!(self);
+                for symbol in group.symbols {
+                    let remapped_symbol = if symbol == Symbol::end_of_nonterminal_extra() {
+                        Symbol::end()
+                    } else {
+                        symbol
+                    };
+                    add_line!(self, "{},", self.symbol_ids[&remapped_symbol]);
+                }
+                dedent!(self);
+            }
         }
+        if current_index == 0 {
+            add_line!(self, "0,");
+        }
+        dedent!(self);
+        add_line!(self, "}};");
+        add_line!(self, "");
+
+        add_line!(
+            self,
+            "static const uint32_t ts_small_parse_table_map[STATE_COUNT] = {{"
+        );
+        indent!(self);
+        for (state_idx, table_index) in small_state_map.iter().enumerate() {
+            if *table_index == u32::MAX {
+                add_line!(self, "[{state_idx}] = UINT32_MAX,");
+            } else {
+                add_line!(self, "[{state_idx}] = {table_index},");
+            }
+        }
+        dedent!(self);
+        add_line!(self, "}};");
+        add_line!(self, "");
     }
 
     /// Emit the legacy (uncompressed) parse table for ABI < 16.
@@ -1828,7 +1976,9 @@ impl Generator {
 
         // Parse table
         add_line!(self, ".parse_table = &ts_parse_table[0][0],");
-        if self.large_state_count < self.parse_table.states.len() {
+        if self.large_state_count < self.parse_table.states.len()
+            || self.abi_version >= ABI_VERSION_WITH_COMPRESSED_TABLES
+        {
             add_line!(self, ".small_parse_table = ts_small_parse_table,");
             add_line!(self, ".small_parse_table_map = ts_small_parse_table_map,");
         }

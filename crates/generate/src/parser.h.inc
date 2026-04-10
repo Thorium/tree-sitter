@@ -149,7 +149,8 @@ struct TSLanguage {
   const TSMapSlice *supertype_map_slices;
   const TSSymbol *supertype_map_entries;
   TSLanguageMetadata metadata;
-  // CSR-compressed parse table (ABI version >= 16)
+  // Hybrid parse table (ABI version >= 16): CSR rows plus optional
+  // small-state entries addressed by `small_parse_table_map[state]`.
   const uint32_t *parse_table_row_offsets;
   const uint16_t *compressed_parse_table;
 };
