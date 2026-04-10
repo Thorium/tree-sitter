@@ -1640,6 +1640,7 @@ impl Generator {
                 }
                 dedent!(self);
             }
+            dedent!(self);
         }
         if current_index == 0 {
             add_line!(self, "0,");
